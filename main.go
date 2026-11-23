@@ -12,29 +12,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type jdtResponse struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	ID      interface{}     `json:"id"`
 	Result  json.RawMessage `json:"result"`
-}
-
-type stdRequest struct {
-	Jsonrpc string          `json:"jsonrpc"`
-	Method  string          `json:"method"`
-	Params  Params          `json:"params"`
-	ID      json.RawMessage `json:"id"`
-}
-
-type Params struct {
-	Position     Position     `json:"position"`
-	TextDocument TextDocument `json:"textDocument"`
-	Range        *Range       `json:"range,omitempty"`
-}
-
-type TextDocument struct {
-	URI string `json:"uri"`
 }
 
 type stdResponse struct {
@@ -94,22 +78,39 @@ func run() error {
 
 	// Forward client -> server
 	m := make(map[string]string)
+	var mu sync.Mutex
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
 		for {
 			body, err := readLSPMessage(reader)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+				return
 			}
 
-			var stdReq *stdRequest
-			if err := json.Unmarshal(body, &stdReq); err != nil {
+			var msg map[string]any
+			if err := json.Unmarshal(body, &msg); err != nil {
 				fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+				return
 			}
 
-			if jdtURI, ok := m[stdReq.Params.TextDocument.URI]; ok {
-				stdReq.Params.TextDocument.URI = jdtURI
-				body, _ = json.Marshal(stdReq)
+			if params, ok := msg["params"].(map[string]any); ok {
+				if textDocument, ok := params["textDocument"].(map[string]any); ok {
+					if uri, ok := textDocument["uri"].(string); ok {
+						mu.Lock()
+						jdtURI, ok := m[uri]
+						mu.Unlock()
+						if ok {
+							textDocument["uri"] = jdtURI
+
+							body, err = json.Marshal(msg)
+							if err != nil {
+								fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+								return
+							}
+						}
+					}
+				}
 			}
 
 			fmt.Fprintf(serverStdin, "Content-Length: %d\r\n\r\n", len(body))
@@ -194,7 +195,9 @@ func run() error {
 					result = strings.ReplaceAll(result, `\t`, "\t")
 					tmpFileName := "/tmp" + strings.TrimSuffix(uri.Path, ".class") + ".java"
 					targetURI := "file://" + tmpFileName
+					mu.Lock()
 					m[targetURI] = uri.String()
+					mu.Unlock()
 					if err := os.MkdirAll(filepath.Dir(tmpFileName), 0755); err != nil {
 						fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
 					}

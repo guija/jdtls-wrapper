@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -79,7 +80,18 @@ func run() error {
 	// Forward client -> server
 	m := make(map[string]string)
 	var mu sync.Mutex
+	var serverMu sync.Mutex
+	writeToServer := func(body []byte) error {
+		serverMu.Lock()
+		defer serverMu.Unlock()
+		return writeLSPMessage(serverStdin, body)
+	}
 	go func() {
+		defer func() {
+			serverMu.Lock()
+			defer serverMu.Unlock()
+			serverStdin.Close()
+		}()
 		reader := bufio.NewReader(os.Stdin)
 		for {
 			body, err := readLSPMessage(reader)
@@ -113,8 +125,10 @@ func run() error {
 				}
 			}
 
-			fmt.Fprintf(serverStdin, "Content-Length: %d\r\n\r\n", len(body))
-			serverStdin.Write(body)
+			if err := writeToServer(body); err != nil {
+				fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+				return
+			}
 		}
 	}()
 
@@ -123,21 +137,22 @@ func run() error {
 	go func() {
 		reader := bufio.NewReader(serverStdout)
 		for {
-			body, err := readLSPMessage(reader)
+			body, jdtResp, err := readJDTResponse(reader)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+				if !errors.Is(err, io.EOF) {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+				}
+				return
 			}
 
 			fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", string(body))
 
-			var jdtResp *jdtResponse
-			if err := json.Unmarshal(body, &jdtResp); err != nil {
-				fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
-			}
-
 			id, ok := getID(jdtResp.ID)
 			if !ok {
-				fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(body), body)
+				if err := writeLSPMessage(os.Stdout, body); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 				continue
 			}
 
@@ -148,18 +163,27 @@ func run() error {
 			}
 
 			if len(jdtResp.Result) == 0 {
-				fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(body), body)
+				if err := writeLSPMessage(os.Stdout, body); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 				continue
 			}
 
 			var definitionResult []jdtResult
 			if err := json.Unmarshal(jdtResp.Result, &definitionResult); err != nil {
-				fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(body), body)
+				if err := writeLSPMessage(os.Stdout, body); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 				continue
 			}
 
 			if len(definitionResult) == 0 {
-				fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(body), body)
+				if err := writeLSPMessage(os.Stdout, body); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 				continue
 			}
 
@@ -228,13 +252,21 @@ func run() error {
 
 					data, err := json.Marshal(stdResp)
 					if err == nil {
-						fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(data), data)
+						if err := writeLSPMessage(os.Stdout, data); err != nil {
+							fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+						}
 					}
 				}
 
-				fmt.Fprintf(serverStdin, "Content-Length: %d\r\n\r\n%s", len(data), data)
+				if err := writeToServer(data); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 			} else {
-				fmt.Fprintf(os.Stdout, "Content-Length: %d\r\n\r\n%s", len(body), body)
+				if err := writeLSPMessage(os.Stdout, body); err != nil {
+					fmt.Fprintln(os.Stderr, "[jdtls-wrapper]", err.Error())
+					return
+				}
 			}
 		}
 	}()
@@ -246,7 +278,9 @@ func run() error {
 		}
 	}()
 
-	cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("jdtls exited: %w", err)
+	}
 
 	return nil
 }
@@ -279,6 +313,32 @@ func readLSPMessage(r *bufio.Reader) (body []byte, err error) {
 	}
 
 	return buf, nil
+}
+
+func readJDTResponse(r *bufio.Reader) ([]byte, *jdtResponse, error) {
+	body, err := readLSPMessage(r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var response *jdtResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return body, nil, err
+	}
+	if response == nil {
+		return body, nil, errors.New("null LSP response")
+	}
+
+	return body, response, nil
+}
+
+func writeLSPMessage(w io.Writer, body []byte) error {
+	if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
+		return err
+	}
+
+	_, err := w.Write(body)
+	return err
 }
 
 func getID(id interface{}) (int, bool) {
